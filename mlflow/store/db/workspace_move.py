@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
+from typing import Literal
 
 import sqlalchemy as sa
 
@@ -334,7 +335,7 @@ def move_resources(
     dry_run: bool = False,
     *,
     verbose: bool = False,
-    artifact_policy: str = "preserve",
+    artifact_policy: Literal["preserve", "copy"] = "preserve",
     default_artifact_root: str | None = None,
 ) -> MoveResult:
     """
