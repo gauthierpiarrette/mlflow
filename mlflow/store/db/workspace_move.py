@@ -462,6 +462,33 @@ def _move_experiments_with_artifact_copy(
                 "No database changes were made. Copied artifacts remain at the "
                 "target root and a rerun will reuse them."
             )
+        # Matching names are not enough: an experiment could have been moved away
+        # and its name recreated while the copy ran, in which case the name flip
+        # and the id-keyed URI rewrites would target different experiments. Require
+        # the exact (id, name, artifact_location) identities the plans were built from.
+        experiments = spec.table
+        current_identities = {
+            row.experiment_id: (row.name, row.artifact_location)
+            for row in conn.execute(
+                sa.select(
+                    experiments.c.experiment_id,
+                    experiments.c.name,
+                    experiments.c.artifact_location,
+                ).where(
+                    experiments.c.workspace == source_workspace,
+                    experiments.c.name.in_(sorted(matched)),
+                )
+            )
+        }
+        planned_identities = {
+            plan.experiment_id: (plan.experiment_name, plan.old_root) for plan in plans
+        }
+        if current_identities != planned_identities:
+            raise RuntimeError(
+                "Experiment identities or artifact locations changed while artifacts "
+                "were being copied. No database changes were made. Copied artifacts "
+                "remain at the target root and a rerun will reuse them."
+            )
         _execute_move(conn, spec, source_workspace, target_workspace, name_filter)
         for plan in plans:
             rewrite_experiment_artifact_uris(conn, plan)

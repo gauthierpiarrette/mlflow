@@ -641,6 +641,8 @@ def test_move_artifact_copy_failure_leaves_database_unchanged(
 ):
     _create_workspace(workspace_store, "team-a")
     exp_id, run, _, _ = _seed_experiment_with_artifacts(tracking_store, "exp-fail")
+    with WorkspaceContext(DEFAULT_WORKSPACE_NAME):
+        old_location = tracking_store.get_experiment(exp_id).artifact_location
 
     with mock.patch.object(
         workspace_move,
@@ -661,7 +663,56 @@ def test_move_artifact_copy_failure_leaves_database_unchanged(
 
     with WorkspaceContext(DEFAULT_WORKSPACE_NAME):
         experiment = tracking_store.get_experiment(exp_id)
-        assert experiment.artifact_location.endswith(str(exp_id))
+        assert experiment.artifact_location == old_location
+        assert tracking_store.get_run(run.info.run_id).info.artifact_uri == run.info.artifact_uri
+
+
+def test_move_artifact_copy_aborts_when_experiment_swapped_during_copy(
+    tracking_store, workspace_store, engine
+):
+    # Simulate another admin moving the experiment to a third workspace and
+    # recreating its name in the source while the copy runs. Matching names alone
+    # would let the flip target the recreated experiment while the URI rewrites
+    # target the original one, so the identity re-validation must abort instead.
+    _create_workspace(workspace_store, "team-a")
+    _create_workspace(workspace_store, "team-c")
+    exp_id, run, _, _ = _seed_experiment_with_artifacts(tracking_store, "exp-race")
+    experiments_table = sa.Table("experiments", sa.MetaData(), autoload_with=engine)
+
+    def _swap_experiment(plan):
+        with engine.begin() as conn:
+            conn.execute(
+                experiments_table
+                .update()
+                .where(experiments_table.c.experiment_id == int(exp_id))
+                .values(workspace="team-c")
+            )
+        with WorkspaceContext(DEFAULT_WORKSPACE_NAME):
+            tracking_store.create_experiment("exp-race")
+        return 0
+
+    with mock.patch.object(
+        workspace_move,
+        "copy_experiment_artifacts",
+        side_effect=_swap_experiment,
+    ) as mock_copy:
+        with pytest.raises(RuntimeError, match="identities or artifact locations changed"):
+            move_resources(
+                engine,
+                source_workspace=DEFAULT_WORKSPACE_NAME,
+                target_workspace="team-a",
+                resource_type="experiments",
+                names=["exp-race"],
+                artifact_policy="copy",
+                default_artifact_root=tracking_store.artifact_root_uri,
+            )
+        mock_copy.assert_called_once()
+
+    # Neither the recreated experiment nor the original moved, and the original's
+    # stored URIs were not rewritten.
+    with WorkspaceContext(DEFAULT_WORKSPACE_NAME):
+        assert tracking_store.get_experiment_by_name("exp-race") is not None
+    with WorkspaceContext("team-c"):
         assert tracking_store.get_run(run.info.run_id).info.artifact_uri == run.info.artifact_uri
 
 
