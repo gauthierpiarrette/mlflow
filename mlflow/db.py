@@ -111,6 +111,31 @@ def _parse_tag(value: str) -> tuple[str, str]:
     return key, val
 
 
+def _echo_artifact_plans(result) -> None:
+    if not result.artifact_plans:
+        return
+    click.echo("Artifact relocation plan:")
+    for plan in result.artifact_plans:
+        click.echo(
+            f"  {plan.experiment_name!r}: {plan.old_root} -> {plan.new_root} "
+            f"(runs: {plan.run_uri_count}, logged models: {plan.model_uri_count}, "
+            f"traces: {plan.trace_uri_count})"
+        )
+        if plan.skipped_uri_count:
+            click.echo(
+                f"    {plan.skipped_uri_count} stored URI(s) not under the old root will be "
+                f"left unchanged, e.g. {plan.skipped_uri_sample[0]}"
+            )
+        if plan.registry_reference_count:
+            click.echo(
+                f"    Warning: {plan.registry_reference_count} registry model version(s) "
+                "reference artifacts under the old root and will keep pointing there."
+            )
+    click.echo(
+        "The old artifact prefix is preserved. Clean it up manually after verifying the move."
+    )
+
+
 @commands.command("move-resources")
 @click.argument("url")
 @click.option(
@@ -150,6 +175,27 @@ def _parse_tag(value: str) -> tuple[str, str]:
     help="Show what would be moved without making changes.",
 )
 @click.option(
+    "--artifact-policy",
+    type=click.Choice(["preserve", "copy"]),
+    default="preserve",
+    show_default=True,
+    help=(
+        "How to handle experiment artifacts (experiments only). 'preserve' keeps the "
+        "stored artifact locations unchanged. 'copy' copies the artifact objects to the "
+        "artifact root resolved for the target workspace and rewrites the stored artifact "
+        "URIs. The old artifact prefix is never deleted."
+    ),
+)
+@click.option(
+    "--default-artifact-root",
+    default=None,
+    help=(
+        "Artifact root the tracking server is started with. Required by "
+        "--artifact-policy copy when the target workspace has no default_artifact_root "
+        "of its own."
+    ),
+)
+@click.option(
     "--verbose",
     "-v",
     is_flag=True,
@@ -164,7 +210,17 @@ def _parse_tag(value: str) -> tuple[str, str]:
     help="Skip the confirmation prompt.",
 )
 def move_resources(
-    url, source_workspace, target_workspace, resource_type, name, tag, dry_run, verbose, yes
+    url,
+    source_workspace,
+    target_workspace,
+    resource_type,
+    name,
+    tag,
+    dry_run,
+    artifact_policy,
+    default_artifact_root,
+    verbose,
+    yes,
 ):
     """
     Move resources from one workspace to another.
@@ -193,6 +249,20 @@ def move_resources(
       # Move all registered models from one workspace to another
       mlflow db move-resources sqlite:///mlflow.db \\
         --from default --to team-a --resource-type registered_models
+      # Move experiments and relocate their artifacts to the target
+      # workspace's artifact root, rewriting stored artifact URIs
+      mlflow db move-resources sqlite:///mlflow.db \\
+        --from default --to team-a --resource-type experiments \\
+        --name training-v1 --artifact-policy copy \\
+        --default-artifact-root s3://mlflow-artifacts
+
+    With --artifact-policy copy (experiments only), artifact objects are copied
+    before any database change, the copy is verified, and the stored artifact
+    URIs of the experiment, its runs, logged models and traces are rewritten in
+    the same transaction as the workspace change. Stored URIs outside the
+    experiment's old artifact root are reported and left unchanged. The old
+    artifact prefix is never deleted. Clean it up manually after verifying the
+    move. Suspend writes to the affected experiments while the command runs.
 
     **IMPORTANT**: Always take a backup of your database before running this command.
     """
@@ -226,6 +296,8 @@ def move_resources(
             tags=parsed_tags,
             dry_run=dry_run or needs_confirmation,
             verbose=verbose,
+            artifact_policy=artifact_policy,
+            default_artifact_root=default_artifact_root,
         )
 
         if not result.names:
@@ -249,6 +321,7 @@ def move_resources(
             )
             for note in extra_notes:
                 click.echo(note)
+            _echo_artifact_plans(result)
             return
 
         if needs_confirmation:
@@ -258,6 +331,7 @@ def move_resources(
             )
             for note in extra_notes:
                 click.echo(note)
+            _echo_artifact_plans(result)
             click.confirm("Proceed with move?", default=False, abort=True)
             # Re-run the full move (including conflict detection) in a new
             # transaction. The preview counts above may differ from the
@@ -272,12 +346,20 @@ def move_resources(
                 tags=parsed_tags,
                 dry_run=False,
                 verbose=verbose,
+                artifact_policy=artifact_policy,
+                default_artifact_root=default_artifact_root,
             )
 
         click.echo(
             f"Moved {result.row_count} {resource_type} row(s) "
             f"from {source_workspace!r} to {target_workspace!r}."
         )
+        if result.copied_file_count:
+            click.echo(
+                f"Copied {result.copied_file_count} artifact file(s) and rewrote stored "
+                "artifact URIs. The old artifact prefix was preserved. Clean it up "
+                "manually after verifying the move."
+            )
     except RuntimeError as e:
         raise click.ClickException(str(e)) from e
     except sqlalchemy.exc.SQLAlchemyError as e:

@@ -106,6 +106,39 @@ Use `--dry-run` to preview what would be moved without making changes, and `-y` 
 confirmation prompt. The command aborts if any resource name would conflict with an existing
 resource in the target workspace.
 
+### Relocating experiment artifacts
+
+By default, moving an experiment preserves its stored artifact locations, so historical artifacts
+and artifacts from new runs keep using the pre-move storage path. To relocate the artifact objects
+to the artifact root resolved for the target workspace and rewrite the stored artifact URIs, pass
+`--artifact-policy copy` (experiments only):
+
+```bash
+mlflow db move-resources <database_uri> \
+  --from default --to team-a --resource-type experiments \
+  --name training-v1 --artifact-policy copy \
+  --default-artifact-root s3://mlflow-artifacts
+```
+
+`--default-artifact-root` must match the value the tracking server is started with. It is not
+required when the target workspace has a `default_artifact_root` of its own, which is then used
+without the `workspaces/<name>` suffix.
+
+The command copies the artifact objects through MLflow's artifact repository abstraction, verifies
+the copy, and only then flips the workspace and rewrites the artifact URIs of the experiment, its
+runs, logged models and traces in a single transaction. A failure at any point leaves the source
+data intact, and rerunning the command reuses already-copied objects. Stored URIs outside the
+experiment's old artifact root, and registry model versions referencing run artifacts, are
+reported and left unchanged. The old artifact prefix is never deleted. Clean it up manually after
+verifying the move.
+
+:::warning[Suspend writes during the move]
+Suspend writes to the affected experiments while the command runs. Runs or traces logged during
+the copy may reference the old artifact prefix without being relocated. Artifact roots that only a
+tracking server can resolve (such as `mlflow-artifacts:/`) are not supported and fail with a clear
+error.
+:::
+
 ## Client Workspace Selection (summary)
 
 - Explicit: `mlflow.set_workspace("team-a")`

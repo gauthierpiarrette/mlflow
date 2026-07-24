@@ -1,11 +1,17 @@
 import uuid
+from pathlib import Path
+from unittest import mock
 
 import pytest
+import sqlalchemy as sa
 
-from mlflow.entities import ExperimentTag
+from mlflow.entities import ExperimentTag, TraceInfo
 from mlflow.entities.model_registry import ModelVersionTag, RegisteredModelTag
+from mlflow.entities.trace_location import TraceLocation
+from mlflow.entities.trace_state import TraceState
 from mlflow.entities.workspace import Workspace
 from mlflow.environment_variables import MLFLOW_ENABLE_WORKSPACES
+from mlflow.store.db import workspace_move
 from mlflow.store.db.workspace_move import _SPEC_BY_MODEL, MoveResult, move_resources
 from mlflow.store.model_registry.sqlalchemy_workspace_store import (
     WorkspaceAwareSqlAlchemyStore as WorkspaceAwareRegistryStore,
@@ -14,6 +20,8 @@ from mlflow.store.workspace.sqlalchemy_store import (
     SqlAlchemyStore as WorkspaceStore,
 )
 from mlflow.tracking._tracking_service import utils as tracking_utils
+from mlflow.utils.file_utils import local_file_uri_to_path
+from mlflow.utils.mlflow_tags import MLFLOW_ARTIFACT_LOCATION
 from mlflow.utils.workspace_context import WorkspaceContext
 from mlflow.utils.workspace_utils import DEFAULT_WORKSPACE_NAME
 
@@ -424,3 +432,286 @@ def test_all_workspace_root_models_have_spec():
         f"Add a _ResourceSpec so move-resources can handle them, or add "
         f"to _INTENTIONALLY_OMITTED if they cannot be moved independently."
     )
+
+
+# ---------------------------------------------------------------------------
+# Artifact relocation (--artifact-policy copy)
+# ---------------------------------------------------------------------------
+
+
+def _seed_experiment_with_artifacts(tracking_store, name):
+    """Create an experiment in the default workspace with a run artifact file, a
+    logged model and a trace, returning the entities whose stored URIs the copy
+    policy must rewrite.
+    """
+    with WorkspaceContext(DEFAULT_WORKSPACE_NAME):
+        exp_id = tracking_store.create_experiment(name)
+        run = tracking_store.create_run(exp_id, user_id="u", start_time=0, tags=[], run_name="run")
+        run_dir = Path(local_file_uri_to_path(run.info.artifact_uri))
+        run_dir.mkdir(parents=True)
+        (run_dir / "model.txt").write_text("weights")
+        model = tracking_store.create_logged_model(experiment_id=exp_id)
+        trace_info = TraceInfo(
+            trace_id=f"tr-{uuid.uuid4().hex}",
+            trace_location=TraceLocation.from_experiment_id(exp_id),
+            request_time=1_000,
+            execution_duration=2_000,
+            state=TraceState.OK,
+        )
+        tracking_store.start_trace(trace_info)
+    return exp_id, run, model, trace_info
+
+
+def test_move_experiments_artifact_policy_copy(tracking_store, workspace_store, engine):
+    _create_workspace(workspace_store, "team-a")
+    exp_id, run, model, trace_info = _seed_experiment_with_artifacts(tracking_store, "exp-art")
+    server_root = tracking_store.artifact_root_uri
+
+    result = move_resources(
+        engine,
+        source_workspace=DEFAULT_WORKSPACE_NAME,
+        target_workspace="team-a",
+        resource_type="experiments",
+        names=["exp-art"],
+        artifact_policy="copy",
+        default_artifact_root=server_root,
+    )
+
+    assert result.names == ["exp-art"]
+    assert result.copied_file_count == 1
+    (plan,) = result.artifact_plans
+    assert plan.new_root.endswith(f"/workspaces/team-a/{exp_id}")
+    assert plan.run_uri_count == 1
+    assert plan.model_uri_count == 1
+    assert plan.trace_uri_count == 1
+    assert plan.skipped_uri_count == 0
+
+    with WorkspaceContext("team-a"):
+        experiment = tracking_store.get_experiment(exp_id)
+        assert experiment.artifact_location == plan.new_root
+
+        moved_run = tracking_store.get_run(run.info.run_id)
+        assert moved_run.info.artifact_uri == f"{plan.new_root}/{run.info.run_id}/artifacts"
+        copied_file = Path(local_file_uri_to_path(moved_run.info.artifact_uri)) / "model.txt"
+        assert copied_file.read_text() == "weights"
+
+        moved_model = tracking_store.get_logged_model(model.model_id)
+        assert moved_model.artifact_location.startswith(plan.new_root)
+
+        moved_trace = tracking_store.get_trace_info(trace_info.trace_id)
+        assert moved_trace.tags[MLFLOW_ARTIFACT_LOCATION].startswith(plan.new_root)
+
+        new_run = tracking_store.create_run(
+            exp_id, user_id="u", start_time=0, tags=[], run_name="run2"
+        )
+        assert new_run.info.artifact_uri.startswith(plan.new_root)
+
+    old_file = Path(local_file_uri_to_path(run.info.artifact_uri)) / "model.txt"
+    assert old_file.read_text() == "weights"
+
+
+def test_move_experiments_artifact_policy_preserve_leaves_uris(
+    tracking_store, workspace_store, engine
+):
+    _create_workspace(workspace_store, "team-a")
+    exp_id, run, _, _ = _seed_experiment_with_artifacts(tracking_store, "exp-keep")
+    with WorkspaceContext(DEFAULT_WORKSPACE_NAME):
+        old_location = tracking_store.get_experiment(exp_id).artifact_location
+
+    move_resources(
+        engine,
+        source_workspace=DEFAULT_WORKSPACE_NAME,
+        target_workspace="team-a",
+        resource_type="experiments",
+        names=["exp-keep"],
+    )
+
+    with WorkspaceContext("team-a"):
+        assert tracking_store.get_experiment(exp_id).artifact_location == old_location
+        assert tracking_store.get_run(run.info.run_id).info.artifact_uri == run.info.artifact_uri
+
+
+def test_move_experiments_artifact_copy_dry_run_makes_no_changes(
+    tracking_store, workspace_store, engine
+):
+    _create_workspace(workspace_store, "team-a")
+    exp_id, _, _, _ = _seed_experiment_with_artifacts(tracking_store, "exp-dry")
+    server_root = tracking_store.artifact_root_uri
+
+    result = move_resources(
+        engine,
+        source_workspace=DEFAULT_WORKSPACE_NAME,
+        target_workspace="team-a",
+        resource_type="experiments",
+        names=["exp-dry"],
+        dry_run=True,
+        artifact_policy="copy",
+        default_artifact_root=server_root,
+    )
+
+    (plan,) = result.artifact_plans
+    assert result.copied_file_count == 0
+    assert not Path(local_file_uri_to_path(plan.new_root)).exists()
+    with WorkspaceContext(DEFAULT_WORKSPACE_NAME):
+        assert tracking_store.get_experiment_by_name("exp-dry") is not None
+
+
+def test_move_artifact_copy_rejected_for_non_experiments(engine, workspace_store):
+    _create_workspace(workspace_store, "team-a")
+    with pytest.raises(RuntimeError, match="only supported for --resource-type experiments"):
+        move_resources(
+            engine,
+            source_workspace=DEFAULT_WORKSPACE_NAME,
+            target_workspace="team-a",
+            resource_type="registered_models",
+            artifact_policy="copy",
+        )
+
+
+def test_move_artifact_copy_requires_artifact_root(tracking_store, workspace_store, engine):
+    _create_workspace(workspace_store, "team-a")
+    _seed_experiment_with_artifacts(tracking_store, "exp-noroot")
+
+    with pytest.raises(RuntimeError, match="Pass --default-artifact-root"):
+        move_resources(
+            engine,
+            source_workspace=DEFAULT_WORKSPACE_NAME,
+            target_workspace="team-a",
+            resource_type="experiments",
+            names=["exp-noroot"],
+            artifact_policy="copy",
+        )
+
+
+def test_move_artifact_copy_uses_workspace_artifact_root(
+    tracking_store, workspace_store, engine, tmp_path
+):
+    workspace_root = (tmp_path / "team-b-root").as_uri()
+    workspace_store.create_workspace(Workspace(name="team-b", default_artifact_root=workspace_root))
+    exp_id, _, _, _ = _seed_experiment_with_artifacts(tracking_store, "exp-wsroot")
+
+    result = move_resources(
+        engine,
+        source_workspace=DEFAULT_WORKSPACE_NAME,
+        target_workspace="team-b",
+        resource_type="experiments",
+        names=["exp-wsroot"],
+        artifact_policy="copy",
+    )
+
+    (plan,) = result.artifact_plans
+    # A workspace-level artifact root is used as is, without the workspaces/<name> suffix.
+    assert plan.new_root == f"{workspace_root}/{exp_id}"
+    with WorkspaceContext("team-b"):
+        assert tracking_store.get_experiment(exp_id).artifact_location == plan.new_root
+
+
+def test_move_artifact_copy_skips_uris_outside_old_root(tracking_store, workspace_store, engine):
+    _create_workspace(workspace_store, "team-a")
+    _, run, _, _ = _seed_experiment_with_artifacts(tracking_store, "exp-skip")
+    external_uri = "s3://elsewhere/bucket/path"
+    runs_table = sa.Table("runs", sa.MetaData(), autoload_with=engine)
+    with engine.begin() as conn:
+        conn.execute(
+            runs_table
+            .update()
+            .where(runs_table.c.run_uuid == run.info.run_id)
+            .values(artifact_uri=external_uri)
+        )
+
+    result = move_resources(
+        engine,
+        source_workspace=DEFAULT_WORKSPACE_NAME,
+        target_workspace="team-a",
+        resource_type="experiments",
+        names=["exp-skip"],
+        artifact_policy="copy",
+        default_artifact_root=tracking_store.artifact_root_uri,
+    )
+
+    (plan,) = result.artifact_plans
+    assert plan.skipped_uri_count == 1
+    assert plan.skipped_uri_sample == (external_uri,)
+    with WorkspaceContext("team-a"):
+        assert tracking_store.get_run(run.info.run_id).info.artifact_uri == external_uri
+
+
+def test_move_artifact_copy_failure_leaves_database_unchanged(
+    tracking_store, workspace_store, engine
+):
+    _create_workspace(workspace_store, "team-a")
+    exp_id, run, _, _ = _seed_experiment_with_artifacts(tracking_store, "exp-fail")
+
+    with mock.patch.object(
+        workspace_move,
+        "copy_experiment_artifacts",
+        side_effect=RuntimeError("copy blew up"),
+    ) as mock_copy:
+        with pytest.raises(RuntimeError, match="copy blew up"):
+            move_resources(
+                engine,
+                source_workspace=DEFAULT_WORKSPACE_NAME,
+                target_workspace="team-a",
+                resource_type="experiments",
+                names=["exp-fail"],
+                artifact_policy="copy",
+                default_artifact_root=tracking_store.artifact_root_uri,
+            )
+        mock_copy.assert_called_once()
+
+    with WorkspaceContext(DEFAULT_WORKSPACE_NAME):
+        experiment = tracking_store.get_experiment(exp_id)
+        assert experiment.artifact_location.endswith(str(exp_id))
+        assert tracking_store.get_run(run.info.run_id).info.artifact_uri == run.info.artifact_uri
+
+
+def test_move_artifact_copy_rejects_server_resolved_roots(tracking_store, workspace_store, engine):
+    _create_workspace(workspace_store, "team-a")
+    exp_id, _, _, _ = _seed_experiment_with_artifacts(tracking_store, "exp-proxy")
+    experiments_table = sa.Table("experiments", sa.MetaData(), autoload_with=engine)
+    with engine.begin() as conn:
+        conn.execute(
+            experiments_table
+            .update()
+            .where(experiments_table.c.experiment_id == int(exp_id))
+            .values(artifact_location=f"mlflow-artifacts:/{exp_id}")
+        )
+
+    with pytest.raises(RuntimeError, match="running tracking server"):
+        move_resources(
+            engine,
+            source_workspace=DEFAULT_WORKSPACE_NAME,
+            target_workspace="team-a",
+            resource_type="experiments",
+            names=["exp-proxy"],
+            artifact_policy="copy",
+            default_artifact_root=tracking_store.artifact_root_uri,
+        )
+
+
+def test_move_artifact_copy_reports_registry_references(
+    tracking_store, workspace_store, registry_store, engine
+):
+    _create_workspace(workspace_store, "team-a")
+    _, run, _, _ = _seed_experiment_with_artifacts(tracking_store, "exp-registry")
+    with WorkspaceContext(DEFAULT_WORKSPACE_NAME):
+        registry_store.create_registered_model("reg-model")
+        version = registry_store.create_model_version(
+            "reg-model", source=f"{run.info.artifact_uri}/model", run_id=run.info.run_id
+        )
+
+    result = move_resources(
+        engine,
+        source_workspace=DEFAULT_WORKSPACE_NAME,
+        target_workspace="team-a",
+        resource_type="experiments",
+        names=["exp-registry"],
+        artifact_policy="copy",
+        default_artifact_root=tracking_store.artifact_root_uri,
+    )
+
+    (plan,) = result.artifact_plans
+    assert plan.registry_reference_count == 1
+    with WorkspaceContext(DEFAULT_WORKSPACE_NAME):
+        unchanged = registry_store.get_model_version_download_uri("reg-model", version.version)
+        assert unchanged == f"{run.info.artifact_uri}/model"

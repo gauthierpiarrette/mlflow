@@ -4,6 +4,12 @@ from dataclasses import dataclass
 
 import sqlalchemy as sa
 
+from mlflow.store.db.workspace_move_artifacts import (
+    ExperimentArtifactPlan,
+    build_experiment_artifact_plans,
+    copy_experiment_artifacts,
+    rewrite_experiment_artifact_uris,
+)
 from mlflow.store.db.workspace_utils import (
     MODEL_CHILD_TABLES,
     format_truncated_list,
@@ -32,6 +38,9 @@ class MoveResult:
 
     names: list[str]
     row_count: int
+    # Populated only when artifact_policy="copy": one plan per moved experiment.
+    artifact_plans: tuple[ExperimentArtifactPlan, ...] = ()
+    copied_file_count: int = 0
 
 
 @dataclass(frozen=True)
@@ -209,6 +218,112 @@ def _find_conflicts(
     return [row[0] for row in conn.execute(stmt.order_by(name_col)).fetchall()]
 
 
+def _plan_move(
+    conn,
+    spec: _ResourceSpec,
+    resource_type: str,
+    source_workspace: str,
+    target_workspace: str,
+    names: list[str] | None,
+    tags: list[tuple[str, str]] | None,
+    verbose: bool,
+):
+    """Validate the move and resolve the matched names, name filter and row count."""
+    validate_workspace_exists(conn, source_workspace)
+    validate_workspace_exists(conn, target_workspace)
+
+    # Fail fast with a clear message if the resource table lacks a
+    # workspace column (DB not migrated to workspace-enabled schema).
+    get_workspace_table(conn, spec.table.name)
+
+    # Build a unified name filter: a SQL subquery (--tag), a small
+    # literal list (--name), or None (move-all).  SQLAlchemy's in_()
+    # handles lists and Select objects identically, so every subsequent
+    # query uses the same one-branch pattern.
+    if tags:
+        name_filter = _tag_names_subquery(spec, source_workspace, tags)
+        matched = {row[0] for row in conn.execute(name_filter).fetchall()}
+    elif names:
+        matched = _resolve_names(conn, spec, source_workspace, names)
+        name_filter = list(matched)
+    else:
+        matched = _resolve_names(conn, spec, source_workspace)
+        name_filter = None
+
+    if not matched:
+        return matched, name_filter, 0
+
+    if conflicts := _find_conflicts(conn, spec, source_workspace, target_workspace, name_filter):
+        formatted = format_truncated_list(
+            [repr(name) for name in conflicts],
+            max_rows=None if verbose else 10,
+        )
+        raise RuntimeError(
+            f"Move aborted: the following {resource_type} already exist "
+            f"in workspace {target_workspace!r} and would conflict: "
+            f"{formatted}\n"
+            "Rename or remove the conflicting resources in the target "
+            "workspace, then retry."
+        )
+
+    table = spec.table
+    name_col = table.c[spec.name_column]
+    count_stmt = (
+        sa.select(sa.func.count()).select_from(table).where(table.c.workspace == source_workspace)
+    )
+    if name_filter is not None:
+        count_stmt = count_stmt.where(name_col.in_(name_filter))
+    row_count = conn.execute(count_stmt).scalar()
+    return matched, name_filter, row_count
+
+
+def _execute_move(
+    conn,
+    spec: _ResourceSpec,
+    source_workspace: str,
+    target_workspace: str,
+    name_filter,
+) -> None:
+    """Flip the workspace column on the resource table and its child tables."""
+    table = spec.table
+    name_col = table.c[spec.name_column]
+
+    def _filtered(stmt, col, _nf=name_filter):
+        return stmt.where(col.in_(_nf)) if _nf is not None else stmt
+
+    conn.execute(
+        _filtered(
+            table
+            .update()
+            .where(table.c.workspace == source_workspace)
+            .values(workspace=target_workspace),
+            name_col,
+        )
+    )
+
+    # Explicitly update child tables because not all backends honour
+    # ON UPDATE CASCADE (e.g. SQLite without the foreign_keys pragma).
+    # Each entry is either a table name str (uses spec.child_name_column)
+    # or a (table_name, column_name) tuple for non-standard FK columns.
+    for entry in spec.child_tables:
+        if isinstance(entry, tuple):
+            child_table_name = entry[0]
+            col_name = entry[1]
+        else:
+            child_table_name = entry
+            col_name = spec.child_name_column
+        child = get_workspace_table(conn, child_table_name)
+        conn.execute(
+            _filtered(
+                child
+                .update()
+                .where(child.c.workspace == source_workspace)
+                .values(workspace=target_workspace),
+                child.c[col_name],
+            )
+        )
+
+
 def move_resources(
     engine: sa.Engine,
     source_workspace: str,
@@ -219,12 +334,22 @@ def move_resources(
     dry_run: bool = False,
     *,
     verbose: bool = False,
+    artifact_policy: str = "preserve",
+    default_artifact_root: str | None = None,
 ) -> MoveResult:
     """
     Move resources of *resource_type* from *source_workspace* to *target_workspace*.
 
     Filter by *names* or *tags* (mutually exclusive).  When neither is provided
     all resources of the type in the source workspace are moved.
+
+    With ``artifact_policy="copy"`` (experiments only), the experiments' artifact
+    objects are copied to the artifact root resolved for the target workspace and
+    the stored artifact URIs (experiment, runs, logged models, trace tags) are
+    rewritten to the new prefix. The copy happens before any database change and
+    the old prefix is never deleted. ``default_artifact_root`` must match the
+    tracking server's ``--default-artifact-root`` when the target workspace has no
+    ``default_artifact_root`` of its own.
 
     Returns a :class:`MoveResult` with ``names`` (sorted list of distinct
     resource names that were moved or would be moved) and ``row_count`` (the
@@ -249,93 +374,101 @@ def move_resources(
     if tags and spec.tag_table is None:
         raise RuntimeError(f"Resource type {resource_type!r} does not support tag filtering.")
 
+    if artifact_policy not in ("preserve", "copy"):
+        raise RuntimeError(f"Unknown artifact policy {artifact_policy!r}.")
+
+    if artifact_policy == "copy":
+        if resource_type != "experiments":
+            raise RuntimeError(
+                "--artifact-policy copy is only supported for --resource-type experiments."
+            )
+        return _move_experiments_with_artifact_copy(
+            engine,
+            spec,
+            source_workspace=source_workspace,
+            target_workspace=target_workspace,
+            names=names,
+            tags=tags,
+            dry_run=dry_run,
+            verbose=verbose,
+            default_artifact_root=default_artifact_root,
+        )
+
     with engine.begin() as conn:
-        validate_workspace_exists(conn, source_workspace)
-        validate_workspace_exists(conn, target_workspace)
-
-        # Fail fast with a clear message if the resource table lacks a
-        # workspace column (DB not migrated to workspace-enabled schema).
-        get_workspace_table(conn, spec.table.name)
-
-        # Build a unified name filter: a SQL subquery (--tag), a small
-        # literal list (--name), or None (move-all).  SQLAlchemy's in_()
-        # handles lists and Select objects identically, so every subsequent
-        # query uses the same one-branch pattern.
-        if tags:
-            name_filter = _tag_names_subquery(spec, source_workspace, tags)
-            matched = {row[0] for row in conn.execute(name_filter).fetchall()}
-        elif names:
-            matched = _resolve_names(conn, spec, source_workspace, names)
-            name_filter = list(matched)
-        else:
-            matched = _resolve_names(conn, spec, source_workspace)
-            name_filter = None
-
+        matched, name_filter, row_count = _plan_move(
+            conn, spec, resource_type, source_workspace, target_workspace, names, tags, verbose
+        )
         if not matched:
             return MoveResult(names=[], row_count=0)
-
-        if conflicts := _find_conflicts(
-            conn, spec, source_workspace, target_workspace, name_filter
-        ):
-            formatted = format_truncated_list(
-                [repr(name) for name in conflicts],
-                max_rows=None if verbose else 10,
-            )
-            raise RuntimeError(
-                f"Move aborted: the following {resource_type} already exist "
-                f"in workspace {target_workspace!r} and would conflict: "
-                f"{formatted}\n"
-                "Rename or remove the conflicting resources in the target "
-                "workspace, then retry."
-            )
-
-        table = spec.table
-        name_col = table.c[spec.name_column]
-
-        def _filtered(stmt, col, _nf=name_filter):
-            return stmt.where(col.in_(_nf)) if _nf is not None else stmt
-
-        row_count = conn.execute(
-            _filtered(
-                sa
-                .select(sa.func.count())
-                .select_from(table)
-                .where(table.c.workspace == source_workspace),
-                name_col,
-            )
-        ).scalar()
-
         if not dry_run:
-            conn.execute(
-                _filtered(
-                    table
-                    .update()
-                    .where(table.c.workspace == source_workspace)
-                    .values(workspace=target_workspace),
-                    name_col,
-                )
-            )
-
-            # Explicitly update child tables because not all backends honour
-            # ON UPDATE CASCADE (e.g. SQLite without the foreign_keys pragma).
-            # Each entry is either a table name str (uses spec.child_name_column)
-            # or a (table_name, column_name) tuple for non-standard FK columns.
-            for entry in spec.child_tables:
-                if isinstance(entry, tuple):
-                    child_table_name = entry[0]
-                    col_name = entry[1]
-                else:
-                    child_table_name = entry
-                    col_name = spec.child_name_column
-                child = get_workspace_table(conn, child_table_name)
-                conn.execute(
-                    _filtered(
-                        child
-                        .update()
-                        .where(child.c.workspace == source_workspace)
-                        .values(workspace=target_workspace),
-                        child.c[col_name],
-                    )
-                )
+            _execute_move(conn, spec, source_workspace, target_workspace, name_filter)
 
     return MoveResult(names=sorted(matched), row_count=row_count)
+
+
+def _move_experiments_with_artifact_copy(
+    engine: sa.Engine,
+    spec: _ResourceSpec,
+    *,
+    source_workspace: str,
+    target_workspace: str,
+    names: list[str] | None,
+    tags: list[tuple[str, str]] | None,
+    dry_run: bool,
+    verbose: bool,
+    default_artifact_root: str | None,
+) -> MoveResult:
+    """Move experiments with artifact relocation, in three phases.
+
+    Phase 1 plans the move and the per-experiment artifact relocation in a
+    read-only transaction. Phase 2 copies and verifies artifact objects outside
+    any transaction, since the copy can be long-running. Phase 3 re-validates the
+    matched set and applies the workspace flip plus URI rewrites atomically. A
+    failure in any phase leaves the source data intact, and rerunning after a
+    partial copy reuses the already-copied objects.
+    """
+    with engine.connect() as conn:
+        matched, _, row_count = _plan_move(
+            conn, spec, "experiments", source_workspace, target_workspace, names, tags, verbose
+        )
+        if not matched:
+            return MoveResult(names=[], row_count=0)
+        plans = build_experiment_artifact_plans(
+            conn, sorted(matched), source_workspace, target_workspace, default_artifact_root
+        )
+
+    if dry_run:
+        return MoveResult(names=sorted(matched), row_count=row_count, artifact_plans=tuple(plans))
+
+    copied_file_count = 0
+    for plan in plans:
+        copied_file_count += copy_experiment_artifacts(plan)
+
+    with engine.begin() as conn:
+        rematched, name_filter, row_count = _plan_move(
+            conn,
+            spec,
+            "experiments",
+            source_workspace,
+            target_workspace,
+            sorted(matched),
+            None,
+            verbose,
+        )
+        if rematched != matched:
+            raise RuntimeError(
+                "Experiments changed while artifacts were being copied "
+                f"(expected {sorted(matched)}, found {sorted(rematched)}). "
+                "No database changes were made. Copied artifacts remain at the "
+                "target root and a rerun will reuse them."
+            )
+        _execute_move(conn, spec, source_workspace, target_workspace, name_filter)
+        for plan in plans:
+            rewrite_experiment_artifact_uris(conn, plan)
+
+    return MoveResult(
+        names=sorted(matched),
+        row_count=row_count,
+        artifact_plans=tuple(plans),
+        copied_file_count=copied_file_count,
+    )
