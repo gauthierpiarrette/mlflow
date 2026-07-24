@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import os
 import posixpath
 import tempfile
 from dataclasses import dataclass
@@ -228,6 +229,9 @@ def copy_experiment_artifacts(plan: ExperimentArtifactPlan) -> int:
         for info in _walk_files(src_repo):
             local_path = src_repo.download_artifacts(info.path, tmp_dir)
             dst_repo.log_artifact(local_path, posixpath.dirname(info.path) or None)
+            # Remove each staged file once uploaded so peak temp disk usage is
+            # bounded by the largest artifact, not the whole experiment.
+            os.remove(local_path)
             copied += 1
     _verify_copy(src_repo, dst_repo, plan)
     return copied
