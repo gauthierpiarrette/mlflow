@@ -111,29 +111,13 @@ def _parse_tag(value: str) -> tuple[str, str]:
     return key, val
 
 
-def _echo_artifact_plans(result) -> None:
-    if not result.artifact_plans:
-        return
-    click.echo("Artifact relocation plan:")
-    for plan in result.artifact_plans:
-        click.echo(
-            f"  {plan.experiment_name!r}: {plan.old_root} -> {plan.new_root} "
-            f"(runs: {plan.run_uri_count}, logged models: {plan.model_uri_count}, "
-            f"traces: {plan.trace_uri_count})"
-        )
-        if plan.skipped_uri_count:
-            click.echo(
-                f"    {plan.skipped_uri_count} stored URI(s) not under the old root will be "
-                f"left unchanged, e.g. {plan.skipped_uri_sample[0]}"
-            )
-        if plan.registry_reference_count:
-            click.echo(
-                f"    Warning: {plan.registry_reference_count} registry model version(s) "
-                "reference artifacts under the old root and will keep pointing there."
-            )
-    click.echo(
-        "The old artifact prefix is preserved. Clean it up manually after verifying the move."
-    )
+def _echo_retargets(result) -> None:
+    if result.retarget_plans:
+        click.echo("Artifact roots to retarget:")
+        for plan in result.retarget_plans:
+            click.echo(f"  {plan.experiment_name!r}: {plan.old_root} -> {plan.new_root}")
+    for skip in result.skipped_retargets:
+        click.echo(f"  {skip.experiment_name!r}: kept at {skip.artifact_location} ({skip.reason})")
 
 
 @commands.command("move-resources")
@@ -176,23 +160,21 @@ def _echo_artifact_plans(result) -> None:
 )
 @click.option(
     "--artifact-policy",
-    type=click.Choice(["preserve", "copy"]),
+    type=click.Choice(["preserve", "retarget"]),
     default="preserve",
     show_default=True,
     help=(
-        "How to handle experiment artifacts (experiments only). 'preserve' keeps the "
-        "stored artifact locations unchanged. 'copy' copies the artifact objects to the "
-        "artifact root resolved for the target workspace and rewrites the stored artifact "
-        "URIs. The old artifact prefix is never deleted."
+        "How to handle experiment artifact locations (experiments only). 'preserve' keeps "
+        "them unchanged. 'retarget' repoints experiments still on the layout derived from "
+        "--default-artifact-root to the target workspace's artifact root. Artifact objects "
+        "and stored run, logged model and trace URIs are not modified."
     ),
 )
 @click.option(
     "--default-artifact-root",
     default=None,
     help=(
-        "Artifact root the tracking server is started with. Required by "
-        "--artifact-policy copy when the target workspace has no default_artifact_root "
-        "of its own."
+        "Artifact root the tracking server is started with. Required by --artifact-policy retarget."
     ),
 )
 @click.option(
@@ -249,20 +231,22 @@ def move_resources(
       # Move all registered models from one workspace to another
       mlflow db move-resources sqlite:///mlflow.db \\
         --from default --to team-a --resource-type registered_models
-      # Move experiments and relocate their artifacts to the target
-      # workspace's artifact root, rewriting stored artifact URIs
+      # Move experiments and repoint their artifact roots to the target
+      # workspace's artifact root (new runs land there, existing artifact
+      # URIs are not modified)
       mlflow db move-resources sqlite:///mlflow.db \\
         --from default --to team-a --resource-type experiments \\
-        --name training-v1 --artifact-policy copy \\
+        --name training-v1 --artifact-policy retarget \\
         --default-artifact-root s3://mlflow-artifacts
 
-    With --artifact-policy copy (experiments only), artifact objects are copied
-    before any database change, the copy is verified, and the stored artifact
-    URIs of the experiment, its runs, logged models and traces are rewritten in
-    the same transaction as the workspace change. Stored URIs outside the
-    experiment's old artifact root are reported and left unchanged. The old
-    artifact prefix is never deleted. Clean it up manually after verifying the
-    move. Suspend writes to the affected experiments while the command runs.
+    With --artifact-policy retarget (experiments only), experiments whose
+    artifact_location still matches the layout derived from
+    --default-artifact-root are repointed to the artifact root resolved for the
+    target workspace, in the same transaction as the move. Artifact objects are
+    not copied or deleted, and stored run, logged model and trace URIs are left
+    unchanged, so everything already logged keeps resolving at its current
+    location while new runs land under the new root. Experiments on custom
+    artifact locations are reported and left unchanged.
 
     **IMPORTANT**: Always take a backup of your database before running this command.
     """
@@ -321,7 +305,7 @@ def move_resources(
             )
             for note in extra_notes:
                 click.echo(note)
-            _echo_artifact_plans(result)
+            _echo_retargets(result)
             return
 
         if needs_confirmation:
@@ -331,7 +315,7 @@ def move_resources(
             )
             for note in extra_notes:
                 click.echo(note)
-            _echo_artifact_plans(result)
+            _echo_retargets(result)
             click.confirm("Proceed with move?", default=False, abort=True)
             # Re-run the full move (including conflict detection) in a new
             # transaction. The preview counts above may differ from the
@@ -354,11 +338,10 @@ def move_resources(
             f"Moved {result.row_count} {resource_type} row(s) "
             f"from {source_workspace!r} to {target_workspace!r}."
         )
-        if result.copied_file_count:
+        if result.retarget_plans or result.skipped_retargets:
             click.echo(
-                f"Copied {result.copied_file_count} artifact file(s) and rewrote stored "
-                "artifact URIs. The old artifact prefix was preserved. Clean it up "
-                "manually after verifying the move."
+                f"Retargeted {len(result.retarget_plans)} experiment artifact root(s), "
+                f"{len(result.skipped_retargets)} kept unchanged."
             )
     except RuntimeError as e:
         raise click.ClickException(str(e)) from e

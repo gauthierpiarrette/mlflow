@@ -6,10 +6,10 @@ from typing import Literal
 import sqlalchemy as sa
 
 from mlflow.store.db.workspace_move_artifacts import (
-    ExperimentArtifactPlan,
-    build_experiment_artifact_plans,
-    copy_experiment_artifacts,
-    rewrite_experiment_artifact_uris,
+    ExperimentRetargetPlan,
+    SkippedRetarget,
+    apply_experiment_retargets,
+    build_experiment_retarget_plans,
 )
 from mlflow.store.db.workspace_utils import (
     MODEL_CHILD_TABLES,
@@ -39,9 +39,10 @@ class MoveResult:
 
     names: list[str]
     row_count: int
-    # Populated only when artifact_policy="copy": one plan per moved experiment.
-    artifact_plans: tuple[ExperimentArtifactPlan, ...] = ()
-    copied_file_count: int = 0
+    # Populated only when artifact_policy="retarget": experiments whose artifact
+    # root was repointed, and those left unchanged with the reason.
+    retarget_plans: tuple[ExperimentRetargetPlan, ...] = ()
+    skipped_retargets: tuple[SkippedRetarget, ...] = ()
 
 
 @dataclass(frozen=True)
@@ -335,7 +336,7 @@ def move_resources(
     dry_run: bool = False,
     *,
     verbose: bool = False,
-    artifact_policy: Literal["preserve", "copy"] = "preserve",
+    artifact_policy: Literal["preserve", "retarget"] = "preserve",
     default_artifact_root: str | None = None,
 ) -> MoveResult:
     """
@@ -344,13 +345,13 @@ def move_resources(
     Filter by *names* or *tags* (mutually exclusive).  When neither is provided
     all resources of the type in the source workspace are moved.
 
-    With ``artifact_policy="copy"`` (experiments only), the experiments' artifact
-    objects are copied to the artifact root resolved for the target workspace and
-    the stored artifact URIs (experiment, runs, logged models, trace tags) are
-    rewritten to the new prefix. The copy happens before any database change and
-    the old prefix is never deleted. ``default_artifact_root`` must match the
-    tracking server's ``--default-artifact-root`` when the target workspace has no
-    ``default_artifact_root`` of its own.
+    With ``artifact_policy="retarget"`` (experiments only), experiments whose
+    ``artifact_location`` still matches the ``<default_artifact_root>/<experiment_id>``
+    layout are repointed to the artifact root resolved for the target workspace, in
+    the same transaction as the move. Artifact objects are not copied or deleted,
+    and stored run, logged model and trace URIs are left unchanged. Experiments on
+    other layouts are reported and keep their location. ``default_artifact_root``
+    must match the tracking server's ``--default-artifact-root``.
 
     Returns a :class:`MoveResult` with ``names`` (sorted list of distinct
     resource names that were moved or would be moved) and ``row_count`` (the
@@ -375,25 +376,19 @@ def move_resources(
     if tags and spec.tag_table is None:
         raise RuntimeError(f"Resource type {resource_type!r} does not support tag filtering.")
 
-    if artifact_policy not in ("preserve", "copy"):
+    if artifact_policy not in ("preserve", "retarget"):
         raise RuntimeError(f"Unknown artifact policy {artifact_policy!r}.")
 
-    if artifact_policy == "copy":
+    if artifact_policy == "retarget":
         if resource_type != "experiments":
             raise RuntimeError(
-                "--artifact-policy copy is only supported for --resource-type experiments."
+                "--artifact-policy retarget is only supported for --resource-type experiments."
             )
-        return _move_experiments_with_artifact_copy(
-            engine,
-            spec,
-            source_workspace=source_workspace,
-            target_workspace=target_workspace,
-            names=names,
-            tags=tags,
-            dry_run=dry_run,
-            verbose=verbose,
-            default_artifact_root=default_artifact_root,
-        )
+        if not default_artifact_root:
+            raise RuntimeError(
+                "--artifact-policy retarget requires --default-artifact-root to recognize "
+                "the legacy artifact layout and resolve the workspace artifact root."
+            )
 
     with engine.begin() as conn:
         matched, name_filter, row_count = _plan_move(
@@ -401,102 +396,23 @@ def move_resources(
         )
         if not matched:
             return MoveResult(names=[], row_count=0)
+
+        retarget_plans: tuple[ExperimentRetargetPlan, ...] = ()
+        skipped_retargets: tuple[SkippedRetarget, ...] = ()
+        if artifact_policy == "retarget":
+            plans, skipped = build_experiment_retarget_plans(
+                conn, sorted(matched), source_workspace, target_workspace, default_artifact_root
+            )
+            retarget_plans = tuple(plans)
+            skipped_retargets = tuple(skipped)
+
         if not dry_run:
             _execute_move(conn, spec, source_workspace, target_workspace, name_filter)
-
-    return MoveResult(names=sorted(matched), row_count=row_count)
-
-
-def _move_experiments_with_artifact_copy(
-    engine: sa.Engine,
-    spec: _ResourceSpec,
-    *,
-    source_workspace: str,
-    target_workspace: str,
-    names: list[str] | None,
-    tags: list[tuple[str, str]] | None,
-    dry_run: bool,
-    verbose: bool,
-    default_artifact_root: str | None,
-) -> MoveResult:
-    """Move experiments with artifact relocation, in three phases.
-
-    Phase 1 plans the move and the per-experiment artifact relocation in a
-    read-only transaction. Phase 2 copies and verifies artifact objects outside
-    any transaction, since the copy can be long-running. Phase 3 re-validates the
-    matched set and applies the workspace flip plus URI rewrites atomically. A
-    failure in any phase leaves the source data intact, and rerunning after a
-    partial copy reuses the already-copied objects.
-    """
-    with engine.connect() as conn:
-        matched, _, row_count = _plan_move(
-            conn, spec, "experiments", source_workspace, target_workspace, names, tags, verbose
-        )
-        if not matched:
-            return MoveResult(names=[], row_count=0)
-        plans = build_experiment_artifact_plans(
-            conn, sorted(matched), source_workspace, target_workspace, default_artifact_root
-        )
-
-    if dry_run:
-        return MoveResult(names=sorted(matched), row_count=row_count, artifact_plans=tuple(plans))
-
-    copied_file_count = 0
-    for plan in plans:
-        copied_file_count += copy_experiment_artifacts(plan)
-
-    with engine.begin() as conn:
-        rematched, name_filter, row_count = _plan_move(
-            conn,
-            spec,
-            "experiments",
-            source_workspace,
-            target_workspace,
-            sorted(matched),
-            None,
-            verbose,
-        )
-        if rematched != matched:
-            raise RuntimeError(
-                "Experiments changed while artifacts were being copied "
-                f"(expected {sorted(matched)}, found {sorted(rematched)}). "
-                "No database changes were made. Copied artifacts remain at the "
-                "target root and a rerun will reuse them."
-            )
-        # Matching names are not enough: an experiment could have been moved away
-        # and its name recreated while the copy ran, in which case the name flip
-        # and the id-keyed URI rewrites would target different experiments. Require
-        # the exact (id, name, artifact_location) identities the plans were built from.
-        experiments = spec.table
-        current_identities = {
-            row.experiment_id: (row.name, row.artifact_location)
-            for row in conn.execute(
-                sa.select(
-                    experiments.c.experiment_id,
-                    experiments.c.name,
-                    experiments.c.artifact_location,
-                ).where(
-                    experiments.c.workspace == source_workspace,
-                    experiments.c.name.in_(sorted(matched)),
-                )
-            )
-        }
-        planned_identities = {
-            plan.experiment_id: (plan.experiment_name, plan.old_root) for plan in plans
-        }
-        if current_identities != planned_identities:
-            raise RuntimeError(
-                "Experiment identities or artifact locations changed while artifacts "
-                "were being copied. No database changes were made. Copied artifacts "
-                "remain at the target root and a rerun will reuse them."
-            )
-        _execute_move(conn, spec, source_workspace, target_workspace, name_filter)
-        for plan in plans:
-            rewrite_experiment_artifact_uris(conn, plan)
+            apply_experiment_retargets(conn, retarget_plans)
 
     return MoveResult(
         names=sorted(matched),
         row_count=row_count,
-        artifact_plans=tuple(plans),
-        copied_file_count=copied_file_count,
+        retarget_plans=retarget_plans,
+        skipped_retargets=skipped_retargets,
     )
